@@ -2,17 +2,21 @@ name: Update IPTV Playlist
 
 on:
   schedule:
-    # 每 6 小时运行一次，时间为 UTC 17 分
-    - cron: "17 */6 * * *"
-
+    # 每月 1 日 UTC 00:30，即北京时间约 08:30
+    - cron: "30 0 1 * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: update-iptv-playlist
+  cancel-in-progress: false
+
 jobs:
   update-playlist:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -23,7 +27,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Generate playlist
+      - name: Generate playlist with logo and EPG
         run: python scripts/update_iptv.py
 
       - name: Commit and push changes
