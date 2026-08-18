@@ -1,174 +1,241 @@
+import http.cookiejar
+import json
 import re
 import sys
-import unicodedata
-from urllib.request import Request, urlopen
+import uuid
+from pathlib import Path
+from urllib.parse import quote, urljoin
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
-PRIMARY_URL = (
+
+SOURCE_URL = (
     "https://raw.githubusercontent.com/"
     "islercn/BeiJing-Unicom-IPTV-List/master/iptv.m3u"
 )
-
-META_URL = (
-    "https://raw.githubusercontent.com/"
-    "dhfjl/iptv/master/iptv.m3u"
-)
-
+EPG_SITE = "https://epg.51zmt.top:8001/"
+EPG_XML = "http://epg.51zmt.top:8000/e.xml.gz"
 OLD_ADDRESS = "192.168.11.1:8888"
 NEW_ADDRESS = "192.168.1.1:4022"
-OUTPUT_FILE = "iptv.m3u"
+OUTPUT_FILE = Path("iptv.m3u")
+MAX_UPLOAD_BYTES = 500 * 1024
+MIN_MATCH_RATE = 0.40
 
 
-def fetch(url):
-    request = Request(
+def request(url, *, opener=None, data=None, headers=None, timeout=60):
+    client = opener or urlopen
+    req = Request(
         url,
+        data=data,
         headers={
-            "User-Agent": "iptv-github-actions-updater/1.0"
+            "User-Agent": "dhfjl-iptv-github-actions/3.0",
+            **(headers or {}),
         },
     )
-    with urlopen(request, timeout=30) as response:
-        data = response.read()
-
-    return data.decode("utf-8-sig", errors="replace")
-
-
-def normalize_name(value):
-    value = unicodedata.normalize("NFKC", value or "")
-    value = value.lower().strip()
-
-    # 统一中英文括号、连接符和空白，方便匹配 CCTV-1 与 CCTV1 等写法
-    value = value.replace("（", "(").replace("）", ")")
-    value = re.sub(r"[\s_\-—–·|/]+", "", value)
-    value = re.sub(r"[()（）]", "", value)
-
-    return value
+    response = client.open(req, timeout=timeout) if opener else client(req, timeout=timeout)
+    with response:
+        return response.read(), response.headers
 
 
-def parse_attributes(extinf_line):
-    return dict(
-        re.findall(r'([\w-]+)="([^"]*)"', extinf_line)
-    )
-
-
-def parse_m3u(text):
-    lines = [
+def channel_urls(text):
+    return [
         line.strip()
-        for line in text.replace("\r\n", "\n").split("\n")
-        if line.strip()
+        for line in text.replace("\r\n", "\n").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
     ]
 
-    entries = []
 
-    for index, line in enumerate(lines):
-        if not line.startswith("#EXTINF"):
+def build_multipart(fields, filename, file_data):
+    boundary = f"----iptv-{uuid.uuid4().hex}"
+    body = bytearray()
+
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        )
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(
+        f'Content-Disposition: form-data; name="m3u_file"; '
+        f'filename="{filename}"\r\n'.encode()
+    )
+    body.extend(b"Content-Type: application/x-mpegURL\r\n\r\n")
+    body.extend(file_data)
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+
+    return bytes(body), boundary
+
+
+def apply_epg_header(text):
+    lines = text.replace("\r\n", "\n").splitlines()
+    header = f'#EXTM3U x-tvg-url="{EPG_XML}"'
+
+    if lines and lines[0].lstrip("\ufeff").startswith("#EXTM3U"):
+        lines[0] = header
+    else:
+        lines.insert(0, header)
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def fix_known_bad_matches(text):
+    corrections = {
+        "BRTV北京卫视": {
+            "id": "30",
+            "name": "北京卫视",
+            "logo": "http://epg.51zmt.top:8000/tb1/ws/beijing.png",
+            "group": "卫视",
+        },
+        "BRTV纪实科教": {
+            "id": "1872",
+            "name": "BRTV纪实科教",
+            "logo": "http://epg.51zmt.top:8000/tb1/sheng/BTV科教.png",
+            "group": "地方",
+        },
+        "BRTV卡酷少儿": {
+            "id": "67",
+            "name": "卡酷动画",
+            "logo": "http://epg.51zmt.top:8000/tb1/qt/kaku.png",
+            "group": "地方",
+        },
+    }
+    output = []
+
+    for line in text.splitlines():
+        if not line.startswith("#EXTINF") or "," not in line:
+            output.append(line)
             continue
 
-        name = line.split(",", 1)[1].strip() if "," in line else ""
-        attributes = parse_attributes(line)
-
-        url = None
-        for next_line in lines[index + 1:]:
-            if next_line.startswith("#"):
-                continue
-            url = next_line
-            break
-
-        if not url:
-            continue
-
-        entries.append(
-            {
-                "extinf": line,
-                "name": name,
-                "attributes": attributes,
-                "url": url,
-            }
+        display_name = line.split(",", 1)[1].strip()
+        correction = next(
+            (
+                values
+                for prefix, values in corrections.items()
+                if display_name.startswith(prefix)
+            ),
+            None,
         )
 
-    return entries
+        if not correction:
+            output.append(line)
+            continue
 
+        output.append(
+            '#EXTINF:-1 '
+            f'tvg-id="{correction["id"]}" '
+            f'tvg-name="{correction["name"]}" '
+            f'tvg-logo="{correction["logo"]}" '
+            f'group-title="{correction["group"]}", {display_name}'
+        )
 
-def metadata_keys(entry):
-    attributes = entry["attributes"]
-
-    values = [
-        entry["name"],
-        attributes.get("tvg-name", ""),
-        attributes.get("tvg-id", ""),
-    ]
-
-    return {
-        normalize_name(value)
-        for value in values
-        if normalize_name(value)
-    }
+    return "\n".join(output).rstrip() + "\n"
 
 
 def main():
-    primary_entries = parse_m3u(fetch(PRIMARY_URL))
-    metadata_entries = parse_m3u(fetch(META_URL))
+    source_bytes, _ = request(SOURCE_URL, timeout=30)
 
-    if len(primary_entries) < 5:
+    if len(source_bytes) > MAX_UPLOAD_BYTES:
+        raise RuntimeError("源播放列表超过网站允许的 500KB")
+
+    source_text = source_bytes.decode("utf-8-sig", errors="strict")
+    source_urls = channel_urls(source_text)
+
+    if len(source_urls) < 5:
+        raise RuntimeError("源播放列表频道数量异常")
+
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = build_opener(HTTPCookieProcessor(cookie_jar))
+    homepage_bytes, _ = request(EPG_SITE, opener=opener, timeout=30)
+    homepage = homepage_bytes.decode("utf-8", errors="replace")
+    csrf_match = re.search(
+        r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', homepage
+    )
+
+    if not csrf_match:
+        raise RuntimeError("无法从 EPG 网站取得 CSRF Token")
+
+    fields = {
+        "csrfmiddlewaretoken": csrf_match.group(1),
+        "use_source_name": "on",
+        # 不传 use_source_category，让网站生成央视/卫视/地方等分组。
+        # 不传 use_source_logo，让网站匹配并写入台标。
+        "unmatched_tvg_name": "noepg",
+    }
+    body, boundary = build_multipart(fields, "iptv.m3u", source_bytes)
+    response_bytes, _ = request(
+        urljoin(EPG_SITE, "upload/"),
+        opener=opener,
+        data=body,
+        timeout=120,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Referer": EPG_SITE,
+            "Origin": EPG_SITE.rstrip("/"),
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRFToken": csrf_match.group(1),
+        },
+    )
+    result = json.loads(response_bytes.decode("utf-8"))
+
+    if not result.get("success"):
+        raise RuntimeError(f"EPG 网站处理失败: {result.get('msg', '未知错误')}")
+
+    output_filename = result.get("output_filename", "")
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]+\.m3u", output_filename):
+        raise RuntimeError("EPG 网站返回了异常的输出文件名")
+
+    reported_total = int(result.get("channel_num", 0))
+    matched = int(result.get("channel_num_check", 0))
+
+    if reported_total != len(source_urls):
         raise RuntimeError(
-            "主播放列表条目数量异常，拒绝覆盖现有文件"
+            f"EPG 网站报告 {reported_total} 个频道，源文件有 {len(source_urls)} 个"
         )
 
-    metadata_map = {}
+    if matched / reported_total < MIN_MATCH_RATE:
+        raise RuntimeError(f"EPG 匹配率过低: {matched}/{reported_total}")
 
-    for entry in metadata_entries:
-        for key in metadata_keys(entry):
-            metadata_map.setdefault(key, entry)
+    download_url = urljoin(
+        EPG_SITE,
+        f"download/{quote(output_filename)}/",
+    )
+    generated_bytes, _ = request(download_url, opener=opener, timeout=60)
+    generated = generated_bytes.decode("utf-8-sig", errors="strict")
+    generated_urls = channel_urls(generated)
 
-    output = ["#EXTM3U"]
-    matched = 0
-    unmatched = []
+    # 网站应当只补全元数据，不能改变频道数量、顺序或播放地址。
+    if generated_urls != source_urls:
+        raise RuntimeError("EPG 网站返回的频道顺序或播放地址发生变化")
 
-    for primary in primary_entries:
-        keys = metadata_keys(primary)
-        metadata = None
+    generated = fix_known_bad_matches(generated)
+    generated = generated.replace(OLD_ADDRESS, NEW_ADDRESS)
+    generated = apply_epg_header(generated)
 
-        for key in keys:
-            if key in metadata_map:
-                metadata = metadata_map[key]
-                break
+    if OLD_ADDRESS in generated:
+        raise RuntimeError("输出文件仍然包含旧地址")
 
-        # 保留北京联通列表的频道顺序和播放地址
-        url = primary["url"].replace(OLD_ADDRESS, NEW_ADDRESS)
+    if generated.count("#EXTINF") != len(source_urls):
+        raise RuntimeError("输出文件频道数量校验失败")
 
-        # 匹配成功时，使用 dhfjl/iptv 的台名、logo、group 等信息
-        if metadata:
-            extinf = metadata["extinf"]
-            matched += 1
-        else:
-            # 匹配不到时保留主列表原有信息，不丢失频道
-            extinf = primary["extinf"]
-            unmatched.append(primary["name"])
+    with OUTPUT_FILE.open("w", encoding="utf-8", newline="\n") as output:
+        output.write(generated)
 
-        output.append(extinf)
-        output.append(url)
+    logo_count = sum(
+        1
+        for line in generated.splitlines()
+        if line.startswith("#EXTINF")
+        and re.search(r'tvg-logo="[^"]+"', line)
+    )
 
-    result = "\n".join(output) + "\n"
-
-    if OLD_ADDRESS in result:
-        raise RuntimeError(
-            "输出文件中仍然存在旧地址"
-        )
-
-    if result.count("#EXTINF") != len(primary_entries):
-        raise RuntimeError(
-            "输出条目数量校验失败"
-        )
-
-    with open(OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as file:
-        file.write(result)
-
-    print(f"主列表频道数: {len(primary_entries)}")
-    print(f"匹配到元数据: {matched}")
-    print(f"未匹配元数据: {len(unmatched)}")
-
-    if unmatched:
-        print("未匹配频道:")
-        for name in unmatched:
-            print(f"- {name}")
+    print(f"源频道数: {len(source_urls)}")
+    print(f"EPG 匹配数: {matched}")
+    print(f"有效台标数: {logo_count}")
+    print(f"地址替换: {OLD_ADDRESS} -> {NEW_ADDRESS}")
+    print(f"EPG 地址: {EPG_XML}")
 
 
 if __name__ == "__main__":
